@@ -779,13 +779,20 @@ ensure_core() {
   fi
 }
 
-backup_state() {
-  local destination
-  destination=$(mktemp "$BACKUPS/$(date +%Y%m%d-%H%M%S)-XXXXXX.json") || return 1
-  if ! cp "$STATE" "$destination"; then rm -f "$destination"; return 1; fi
-  chmod 600 "$destination" || return 1
+backup_state() (
+  local directory="${1:-$BACKUPS}" prefix="${2:-$(date +%Y%m%d-%H%M%S)}" temporary='' destination
+  cleanup_backup() { [[ -z "$temporary" ]] || rm -f "$temporary"; }
+  trap cleanup_backup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  # BusyBox 要求模板以 XXXXXX 结尾；复制完成后再添加 .json 扩展名。
+  temporary=$(mktemp "$directory/$prefix-XXXXXX") || exit 1
+  destination="$temporary.json"
+  cp "$STATE" "$temporary" && chmod 600 "$temporary" && mv -nT "$temporary" "$destination" || exit 1
+  # mv -n 在目标已存在时也可能返回成功，必须确认临时文件确实已移走。
+  [[ ! -e "$temporary" ]] || { fail '备份文件名已存在，没有覆盖原备份。'; exit 1; }
   printf '%s\n' "$destination"
-}
+)
 
 apply_state() (
   local candidate="$1" recovery="${2:-0}" temporary active=0 enabled=0 committed=0 done=0 count
@@ -1078,8 +1085,7 @@ uninstall() {
   say '确认后会在配置目录旁保留最后一份规则 JSON；原始下载文件夹保留。'
   IFS= read -r -p '若确定，请完整输入「确认卸载」：' answer || return 1
   [[ "$answer" == 确认卸载 ]] || { say '已取消。'; return 1; }
-  backup_copy=$(mktemp "$(dirname "$ETC_DIR")/realm-deploy-backup-$(date +%Y%m%d-%H%M%S)-XXXXXX.json") || return 1
-  cp "$STATE" "$backup_copy" && chmod 600 "$backup_copy" || return 1
+  backup_copy=$(backup_state "$(dirname "$ETC_DIR")" "realm-deploy-backup-$(date +%Y%m%d-%H%M%S)") || return 1
   service_stop && service_disable || return 1
   rm -f "$UNIT_FILE" "$OPENRC_FILE" "$CORE_LINK" "$ENTRY" || return 1
   if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload 9>&- || return 1; fi
