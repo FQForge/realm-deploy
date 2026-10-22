@@ -131,6 +131,79 @@ normalize_host() {
   say "$normalized"
 }
 
+# 从内核读取本机地址，不依赖 ip / hostname，也不把 NAT 出口 IP 当成本机地址。
+local_ip_addresses() {
+  local family="${1:-4}" address rest expanded index
+  if [[ "$family" == 4 ]]; then
+    [[ -r /proc/net/fib_trie ]] || return 0
+    awk '$1 == "|--" { address=$2 }
+         $1 == "/32" && $2 == "host" && $3 == "LOCAL" && !seen[address]++ { print address }' /proc/net/fib_trie
+  else
+    [[ -r /proc/net/if_inet6 ]] || return 0
+    while read -r address rest; do
+      expanded=''
+      for ((index=0; index<32; index+=4)); do expanded+="${address:index:4}:"; done
+      normalize_ipv6 "${expanded%:}" || true
+    done < /proc/net/if_inet6
+  fi
+}
+
+is_local_ip() {
+  local address="$1" family=4 candidate
+  [[ "$address" != *:* ]] || family=6
+  while IFS= read -r candidate; do
+    [[ "$address" != "$candidate" ]] || return 0
+  done < <(local_ip_addresses "$family")
+  return 1
+}
+
+normalize_public_ip() {
+  local address="$1" expanded first second
+  if [[ "$address" == *:* ]]; then
+    address=$(normalize_ipv6 "$address") || return 1
+    expanded=$(normalize_ipv6 "$address" expanded) || return 1
+    # 自动识别只接受全球单播地址，排除文档示例地址。
+    [[ "$expanded" == [23]* && "$expanded" != 20010db8* && "$expanded" != 3fff0* ]] || return 1
+  else
+    address=$(normalize_ipv4 "$address") || return 1
+    case "$address" in
+      0.*|10.*|127.*|169.254.*|192.0.0.*|192.0.2.*|192.168.*|192.88.99.*|198.51.100.*|203.0.113.*) return 1 ;;
+    esac
+    IFS=. read -r first second _ <<< "$address"
+    ((first < 224 && (first != 100 || second < 64 || second > 127) &&
+      (first != 172 || second < 16 || second > 31) && (first != 198 || second < 18 || second > 19))) || return 1
+  fi
+  say "$address"
+}
+
+detect_local_public_ip() {
+  local family="${1:-4}" addresses address ssh_host=''
+  addresses=$(local_ip_addresses "$family") || return 1
+  read -r _ _ ssh_host _ <<< "${SSH_CONNECTION:-}"
+  # 多公网 IP 的服务器优先使用当前 SSH 连接到的本机地址。
+  if address=$(normalize_public_ip "$ssh_host") && [[ $'\n'"$addresses"$'\n' == *$'\n'"$address"$'\n'* ]]; then
+    say "$address"; return 0
+  fi
+  while IFS= read -r address; do
+    if address=$(normalize_public_ip "$address"); then say "$address"; return 0; fi
+  done <<< "$addresses"
+  return 1
+}
+
+detect_public_ip() {
+  local family="${1:-4}" address url
+  if address=$(detect_local_public_ip "$family"); then say "$address"; return 0; fi
+  for url in https://api64.ipify.org https://icanhazip.com; do
+    # 绕过代理，避免识别成代理服务器的 IP；失败最多等待数秒，仍可手动填写。
+    address=$(curl "-$family" --noproxy '*' -fsS --connect-timeout 2 --max-time 3 --max-filesize 64 "$url" 2>/dev/null) || continue
+    address=$(normalize_public_ip "$address") || continue
+    if [[ "$family" == 4 && "$address" != *:* || "$family" == 6 && "$address" == *:* ]]; then
+      say "$address"; return 0
+    fi
+  done
+  return 1
+}
+
 data_field() {
   local kind="$1" value="$2"
   case "$kind" in
@@ -870,7 +943,7 @@ choose_rule() {
 
 rule_wizard() {
   local rule_id="${1:-}" mode="${2:-quick}" rule_name='' listen_host=0.0.0.0 listen_port='' remote_host='' remote_port=''
-  local public_host='' public_port='' enabled=true temporary suggested
+  local public_host='' public_port='' enabled=true temporary suggested family=4
   local -a fields=()
   if [[ -n "$rule_id" ]]; then
     mode=custom
@@ -898,15 +971,38 @@ rule_wizard() {
   say ''
   prompt remote_host '目标服务器 IP / 域名（不带端口和 https://）' "$remote_host" host || return 0
   prompt remote_port '目标服务端口（就是原节点的端口）' "$remote_port" port || return 0
+  if ((${#fields[@]} == 0)); then
+    listen_host=$(detect_local_public_ip 4) || listen_host=0.0.0.0
+  fi
   if [[ "$mode" == custom ]]; then
-    prompt listen_host '本机监听 IP（0.0.0.0 接受所有 IPv4；:: 用于 IPv6）' "$listen_host" listen || return 0
+    prompt listen_host '本机监听 IP（本机公网 IP；NAT 可用 0.0.0.0；IPv6 可用 ::）' "$listen_host" listen || return 0
   fi
   suggested="$listen_port"
   [[ -n "$suggested" ]] || suggested=$(data auto-port "$STATE" "$listen_host") || return 1
   prompt listen_port '入口服务器本机监听端口（回车使用空闲端口）' "$suggested" port || return 0
   if ((${#fields[@]})) && [[ "$public_port" == "${fields[2]}" ]]; then public_port="$listen_port"; fi
-  say '  公网地址通常是 SSH 登录这台服务器时使用的 IP / 域名；也可以稍后补填。'
-  prompt public_host '入口公网 IP / 域名（可以留空）' "$public_host" public || return 0
+  if ((${#fields[@]} == 0)); then
+    if normalize_public_ip "$listen_host" >/dev/null && is_local_ip "$listen_host"; then
+      public_host="$listen_host"
+    else
+      [[ "$listen_host" != *:* ]] || family=6
+      info '正在自动识别入口公网 IP…'
+      public_host=$(detect_public_ip "$family") || public_host=''
+    fi
+  fi
+  if [[ -n "$public_host" ]]; then
+    say '  公网地址已填好，直接回车确认；也可以改成自己的公网 IP / 域名。'
+    prompt public_host '入口公网 IP / 域名' "$public_host" public || return 0
+  else
+    say '  请填写 SSH 登录这台服务器时使用的公网 IP / 域名；暂时不知道也可稍后补填。'
+    prompt public_host '入口公网 IP / 域名（可以留空）' '' public || return 0
+  fi
+  if [[ "$mode" == quick ]]; then
+    if is_local_ip "$public_host"; then listen_host="$public_host"; fi
+    if [[ "$listen_host" == 0.0.0.0 ]]; then
+      say '  本机未识别到可直接监听的公网 IP，使用 0.0.0.0 接收连接；客户端填写入口公网地址。'
+    fi
+  fi
   if [[ "$mode" == custom ]]; then
     prompt public_port '入口公网端口（普通 VPS 直接回车；NAT 填服务商分配的公网端口）' "${public_port:-$listen_port}" port || return 0
     prompt rule_name '给这条规则起个名称' "$rule_name" name || return 0
