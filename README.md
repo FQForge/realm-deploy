@@ -13,7 +13,7 @@
 推荐使用 **Debian 12 / 13、Ubuntu 22.04 / 24.04**。登录**入口服务器**，复制整行执行：
 
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/fengqi0216/realm-deploy/main/install-realm.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/FQForge/realm-deploy/main/install-realm.sh)"
 ```
 
 安装完成会自动打开中文菜单。以后输入：
