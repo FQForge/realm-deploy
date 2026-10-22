@@ -64,7 +64,7 @@ chmod 600 "$helper_tmp"
 mv -f "$helper_tmp" "$HELPER_TARGET"
 mv -f "$entry_tmp" "$ENTRY"
 printf '[+] 管理命令安装完成：%s\n' "$ENTRY"
-printf '%s\n' '以后输入 sudo rnode 打开中文菜单。创建第一条规则时会自动安装 Realm 内核。'
+printf '%s\n' '以后输入 rnode 打开中文菜单；普通用户使用 sudo rnode。选择 1 即可创建转发。'
 # 运行刚安装的副本，确保移走下载文件夹后仍可使用。
 export RLM_HELPER_TARGET="$HELPER_TARGET"
 exec bash "$ENTRY" "$@"

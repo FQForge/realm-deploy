@@ -152,9 +152,11 @@ from pathlib import Path
 import shutil
 import sys
 args = sys.argv[1:]
-output = args[args.index("-o") + 1]
+output = args[args.index("-o") + 1] if "-o" in args else None
 url = args[-1]
 root = Path(os.environ["TEST_ROOT"])
+with (root / "downloads.log").open("a") as log:
+    log.write(url + "\\n")
 if url.startswith("https://api.github.com/repos/zhboner/realm/releases/"):
     source = root / "release.json"
 elif url.startswith("https://github.com/zhboner/realm/releases/download/"):
@@ -163,7 +165,10 @@ elif url.startswith("https://raw.githubusercontent.com/"):
     source = Path(os.environ["TEST_PROJECT"]) / url.rsplit("/", 1)[1]
 else:
     sys.exit("Unexpected URL: " + url)
-shutil.copyfile(source, output)
+if output:
+    shutil.copyfile(source, output)
+else:
+    sys.stdout.buffer.write(source.read_bytes())
 '''
 
 # The production helper is unchanged. Only sandboxed integration tests replace
@@ -260,20 +265,58 @@ class IntegrationTests(unittest.TestCase):
             "browser_download_url": "https://github.com/zhboner/realm/releases/download/v9.9.9/" + self.asset}]
         }))
 
-    def test_wizard_creates_expected_forwarding_and_can_cancel(self):
-        number = free_port()
-        answers = f"example.com\n443\n{number}\n203.0.113.10\n\n中文入口\ny\n"
+    def test_quick_wizard_selects_port_and_name_and_can_cancel(self):
+        answers = "example.com\n443\n\n203.0.113.10\ny\n"
         result = self.run_bash("detect_system; init_data; wait_service() { return 0; }; rule_wizard", input_text=answers)
         saved = DATA.load(self.state_path)["rules"][0]
-        self.assertEqual(saved["listen_port"], number)
-        self.assertEqual(saved["public_port"], number)
+        self.assertEqual(saved["listen_host"], "0.0.0.0")
+        self.assertEqual(saved["public_port"], saved["listen_port"])
         self.assertEqual(saved["remote_host"], "example.com")
-        self.assertEqual(saved["name"], "中文入口")
+        self.assertEqual(saved["remote_port"], 443)
+        self.assertEqual(saved["name"], "转发-1")
+        self.assertIn(f'listen = "0.0.0.0:{saved["listen_port"]}"', self.config_path.read_text())
+        self.assertIn('remote = "example.com:443"', self.config_path.read_text())
         self.assertIn("客户端服务器地址：203.0.113.10", result.stdout)
+        self.assertIn(f'客户端服务器端口：{saved["listen_port"]}', result.stdout)
         self.assertTrue((self.root / "enabled").exists())
         before = self.state_path.read_bytes()
         self.run_bash("detect_system; init_data; rule_wizard", input_text="q\n")
         self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_quick_wizard_declining_confirmation_does_not_install_or_save(self):
+        before = self.state_path.read_bytes()
+        self.core_link.unlink()
+        answers = "example.com\n443\n\n203.0.113.10\nn\n"
+        self.run_bash("detect_system; init_data; rule_wizard", input_text=answers)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(list((self.root / "etc/backups").glob("*.json")), [])
+        self.assertFalse(self.core_link.exists())
+        self.assertFalse((self.root / "downloads.log").exists())
+
+    def test_custom_menu_creates_nat_rule_with_separate_public_port(self):
+        number = free_port()
+        public_port = 31415 if number != 31415 else 31416
+        answers = f"4\nexample.com\n443\n127.0.0.1\n{number}\n203.0.113.10\n{public_port}\n中文入口\ny\n"
+        result = self.run_bash("detect_system; init_data; wait_service() { return 0; }; advanced_menu", input_text=answers)
+        saved = DATA.load(self.state_path)["rules"][0]
+        self.assertEqual(saved["listen_host"], "127.0.0.1")
+        self.assertEqual(saved["listen_port"], number)
+        self.assertEqual(saved["public_port"], public_port)
+        self.assertEqual(saved["name"], "中文入口")
+        self.assertIn(f"客户端服务器端口：{public_port}", result.stdout)
+        self.assertIn(f"公网 {public_port} → 本机 {number}", result.stdout)
+
+    def test_editing_nat_rule_keeps_public_mapping_and_name(self):
+        original = rule()
+        original["public_port"] = original["listen_port"] + 1
+        self.write_state(state(original))
+        number = free_port()
+        while number in (original["listen_port"], original["public_port"]):
+            number = free_port()
+        answers = f"\n8443\n\n{number}\n\n\n\ny\n"
+        self.run_bash("detect_system; init_data; wait_service() { return 0; }; rule_wizard 1", input_text=answers)
+        expected = dict(original, remote_port=8443, listen_port=number)
+        self.assertEqual(DATA.load(self.state_path), state(expected))
 
     def test_successful_apply_saves_previous_backup(self):
         before = state(rule())
@@ -400,9 +443,27 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(entry.read_text(), "unrelated command\n")
 
     def test_online_installer_fetches_all_required_files(self):
-        env = dict(self.env, RLM_GITHUB_OWNER="example-user", TMPDIR=str(self.root))
+        env = dict(self.env, RLM_GITHUB_OWNER="example-user", RLM_GITHUB_REPO="custom-realm",
+                   RLM_GITHUB_REF="v1.0", RLM_GITHUB_PATH="tools", TMPDIR=str(self.root))
         self.run_command(["sh", str(PROJECT / "install-realm.sh"), "--help"], env=env)
         self.assertTrue(Path(env["RLM_ENTRY"]).is_file())
+        urls = (self.root / "downloads.log").read_text().splitlines()
+        self.assertEqual(urls, [f"https://raw.githubusercontent.com/example-user/custom-realm/v1.0/tools/{filename}"
+                                for filename in ("install.sh", "realm.sh", "realm-data.py")])
+        self.assertEqual(list(self.root.glob("realm-install.*")), [])
+
+    def test_one_command_install_opens_menu_without_repository_settings(self):
+        env = {key: value for key, value in self.env.items() if not key.startswith("RLM_GITHUB_")}
+        env["TMPDIR"] = str(self.root)
+        command = 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/fengqi0216/realm-deploy/main/install-realm.sh)"'
+        result = self.run_command(["sh", "-c", command], input_text="0\n", env=env)
+        self.assertIn("Realm 中文转发管理", result.stdout)
+        self.assertIn("快速创建转发", result.stdout)
+        self.assertEqual(Path(env["RLM_ENTRY"]).read_bytes(), (PROJECT / "realm.sh").read_bytes())
+        self.assertEqual(Path(env["RLM_HELPER_TARGET"]).read_bytes(), (PROJECT / "realm-data.py").read_bytes())
+        urls = (self.root / "downloads.log").read_text().splitlines()
+        self.assertEqual(urls, [f"https://raw.githubusercontent.com/fengqi0216/realm-deploy/main/{filename}"
+                                for filename in ("install-realm.sh", "install.sh", "realm.sh", "realm-data.py")])
         self.assertEqual(list(self.root.glob("realm-install.*")), [])
 
     def test_uninstall_requires_phrase_then_keeps_external_backup(self):

@@ -108,7 +108,7 @@ ensure_dependencies() {
     fail '需要 Python 3.9 或更新版本，推荐使用 Debian 12 / Ubuntu 22.04 及更新系统。'; return 1;
   }
   if [[ ! -f "$DATA_TOOL" ]] || ! grep -Fq '# Realm deploy data:' "$DATA_TOOL"; then
-    fail '未找到配套 realm-data.py。请将完整文件夹下载后执行 sh install.sh。'; return 1;
+    fail '未找到配套 realm-data.py。请重新执行 README 中的一键安装命令，或从完整文件夹运行 sh install.sh。'; return 1;
   fi
 }
 
@@ -483,10 +483,11 @@ choose_rule() {
 }
 
 rule_wizard() {
-  local rule_id="${1:-}" rule_name='' listen_host=0.0.0.0 listen_port='' remote_host='' remote_port=''
+  local rule_id="${1:-}" mode="${2:-quick}" rule_name='' listen_host=0.0.0.0 listen_port='' remote_host='' remote_port=''
   local public_host='' public_port='' enabled=true temporary suggested
   local -a fields=()
   if [[ -n "$rule_id" ]]; then
+    mode=custom
     temporary=$(mktemp "$ETC_DIR/.fields.XXXXXX") || return 1
     if ! data get "$STATE" "$rule_id" > "$temporary"; then rm -f "$temporary"; return 1; fi
     mapfile -t fields < "$temporary"
@@ -498,15 +499,20 @@ rule_wizard() {
   else
     rule_id=$(data next-id "$STATE") || return 1
     rule_name="转发-$rule_id"
-    title '创建第一条 / 新的转发规则'
+    if [[ "$mode" == custom ]]; then title '自定义创建转发（NAT / IPv6 / 名称）'
+    else title '快速创建转发（普通 VPS）'
+    fi
   fi
   say '  入口 = 当前这台转发服务器；目标 = 已经运行节点或其他服务的服务器。'
   say '  例如：客户端 → 入口:20000 → 目标:443。两边端口可以不同。'
   say '  每一步输入 q 都可以取消，直接回车采用方括号中的默认值。'
+  if [[ "$mode" == quick ]]; then
+    say '  只需填写下面 4 项，名称自动生成；NAT / IPv6 请到主菜单 7 → 4。'
+  fi
   say ''
   prompt remote_host '目标服务器 IP / 域名（不带端口和 https://）' "$remote_host" host || return 0
   prompt remote_port '目标服务端口（就是原节点的端口）' "$remote_port" port || return 0
-  if ((${#fields[@]})); then
+  if [[ "$mode" == custom ]]; then
     prompt listen_host '本机监听 IP（0.0.0.0 接受所有 IPv4；:: 用于 IPv6）' "$listen_host" listen || return 0
   fi
   suggested="$listen_port"
@@ -515,21 +521,27 @@ rule_wizard() {
   if ((${#fields[@]})) && [[ "$public_port" == "${fields[2]}" ]]; then public_port="$listen_port"; fi
   say '  公网地址通常是 SSH 登录这台服务器时使用的 IP / 域名；也可以稍后补填。'
   prompt public_host '入口公网 IP / 域名（可以留空）' "$public_host" public || return 0
-  prompt public_port '入口公网端口（普通 VPS 与监听端口相同；NAT 填服务商分配的公网端口）' "${public_port:-$listen_port}" port || return 0
-  prompt rule_name '给这条规则起个名称' "$rule_name" name || return 0
+  if [[ "$mode" == custom ]]; then
+    prompt public_port '入口公网端口（普通 VPS 直接回车；NAT 填服务商分配的公网端口）' "${public_port:-$listen_port}" port || return 0
+    prompt rule_name '给这条规则起个名称' "$rule_name" name || return 0
+  else
+    public_port="$listen_port"
+  fi
   temporary=$(mktemp "$ETC_DIR/.rule.XXXXXX") || return 1
   if ! data put "$STATE" "$temporary" "$rule_id" "$rule_name" "$listen_host" "$listen_port" "$remote_host" "$remote_port" "$public_host" "$public_port" "$enabled"; then
     rm -f "$temporary"; return 1
   fi
   data show "$temporary" "$rule_id" || { rm -f "$temporary"; return 1; }
   say ''
-  if ! confirm '确认保存？启用的规则将立即启动，其他连接可能会短暂重连'; then rm -f "$temporary"; say '已取消，没有保存。'; return 0; fi
+  if ! confirm '确认保存并应用？已有转发可能会短暂重连'; then rm -f "$temporary"; say '已取消，没有保存。'; return 0; fi
   if ! data check-ports "$temporary" "$STATE"; then rm -f "$temporary"; return 1; fi
   if [[ $(data count "$temporary" enabled) != 0 ]] && ! ensure_core; then rm -f "$temporary"; return 1; fi
   if apply_state "$temporary"; then
     rm -f "$temporary"
     data show "$STATE" "$rule_id"
-    say '  客户端请修改“服务器地址”和“服务器端口”，保留原节点的其他参数。'
+    say ''
+    say '  下一步：1. 按上面的端口放行防火墙和服务商安全组。'
+    say '          2. 在客户端复制一份原节点，修改“服务器地址”和“服务器端口”，其他参数保持原样。'
   else rm -f "$temporary"; return 1
   fi
 }
@@ -698,12 +710,13 @@ uninstall() {
 
 advanced_menu() {
   local choice requested
-  title '高级设置'
+  title '更多功能'
   item 1 '更新 / 切换 Realm 官方内核（保留规则）'
   item 2 '检查系统兼容性'
   item 3 '完全卸载（会要求再次确认）'
+  item 4 '自定义创建转发（NAT / IPv6 / 自定义名称）'
   item 0 '返回主菜单'
-  IFS= read -r -p '请选择 [0-3]：' choice || return 0
+  IFS= read -r -p '请选择 [0-4]：' choice || return 0
   case "$choice" in
     1)
       IFS= read -r -p '输入版本号，或直接回车使用最新正式版 [latest]：' requested || return 0
@@ -711,8 +724,9 @@ advanced_menu() {
       install_core "${requested:-latest}" ;;
     2) check_system ;;
     3) if uninstall; then return 10; else return 1; fi ;;
+    4) rule_wizard '' custom ;;
     0) return 0 ;;
-    *) fail '请输入 0～3。' ;;
+    *) fail '请输入 0～4。' ;;
   esac
 }
 
@@ -729,7 +743,7 @@ menu() {
     item 4 '管理规则（修改 / 启用 / 停用 / 删除）'
     item 5 '服务管理（状态 / 启停 / 日志 / 诊断）'
     item 6 '备份 / 恢复'
-    item 7 '高级设置（更新内核 / 检查系统 / 卸载）'
+    item 7 '更多功能（NAT / IPv6 / 更新 / 卸载）'
     item 0 '退出'
     say ''
     say '  新手：选 1 → 填目标地址与端口 → 保存 → 放行入口端口 → 修改客户端。'
