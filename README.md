@@ -95,4 +95,4 @@ sudo rnode diagnose
 
 **卸载：** 选择 **7 → 3**，按提示完整输入 `确认卸载`。最后一份规则备份会保留，路径会打印出来。
 
-需要更多说明时，查看 [详细用法与排错](docs/advanced.md)；开发与验证说明见 [开发文档](docs/development.md)。
+支持 systemd / OpenRC。安装会自动补齐依赖；更新时继续使用原有规则和 JSON 备份。

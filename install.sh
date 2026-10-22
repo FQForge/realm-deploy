@@ -1,5 +1,5 @@
 #!/bin/sh
-# Realm deploy installer: install the local manager and its data helper.
+# Realm deploy installer: install the standalone Shell manager.
 set -eu
 umask 077
 
@@ -9,10 +9,8 @@ error() { printf '[错误] %s\n' "$*" >&2; exit 1; }
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 SCRIPT="$SCRIPT_DIR/realm.sh"
-HELPER="$SCRIPT_DIR/realm-data.py"
-if [ ! -f "$SCRIPT" ] || [ ! -f "$HELPER" ]; then error '请将 install.sh、realm.sh 和 realm-data.py 放在同一文件夹。'; fi
+[ -f "$SCRIPT" ] || error '请将 install.sh 和 realm.sh 放在同一文件夹。'
 grep -Fq '# Realm deploy manager:' "$SCRIPT" || error 'realm.sh 文件标记不匹配。'
-grep -Fq '# Realm deploy data:' "$HELPER" || error 'realm-data.py 文件标记不匹配。'
 
 if ! command -v bash >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
@@ -27,12 +25,10 @@ if ! command -v bash >/dev/null 2>&1; then
 fi
 command -v bash >/dev/null 2>&1 || error 'Bash 安装失败，请检查系统软件源。'
 bash -n "$SCRIPT" || error '管理脚本语法检查未通过，没有覆盖现有命令。'
-# 先验证运行环境和 Python 文件，再覆盖已安装的命令。
+# 先验证运行环境，再覆盖已安装的命令。
 bash -c 'source "$1"; detect_system && need_service_manager && ensure_dependencies' realm-installer "$SCRIPT"
-python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$HELPER" || error '数据工具语法检查未通过。'
 
 ENTRY="${RLM_ENTRY:-/usr/local/bin/rnode}"
-HELPER_TARGET="${RLM_HELPER_TARGET:-/usr/local/lib/realm-deploy/realm-data.py}"
 check_target() {
   case "$1" in
     /*) ;;
@@ -44,27 +40,23 @@ check_target() {
   fi
 }
 check_target "$ENTRY" '# Realm deploy manager:'
-check_target "$HELPER_TARGET" '# Realm deploy data:'
-[ "$ENTRY" != "$HELPER_TARGET" ] || error '管理脚本和数据工具的安装路径不能相同。'
-mkdir -p "$(dirname "$ENTRY")" "$(dirname "$HELPER_TARGET")"
+mkdir -p "$(dirname "$ENTRY")"
 entry_tmp=$(mktemp "$(dirname "$ENTRY")/.rnode-install.XXXXXX")
-helper_tmp=''
 cleanup() {
   rm -f "$entry_tmp"
-  [ -z "$helper_tmp" ] || rm -f "$helper_tmp"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-helper_tmp=$(mktemp "$(dirname "$HELPER_TARGET")/.realm-data-install.XXXXXX")
 cat "$SCRIPT" > "$entry_tmp"
-cat "$HELPER" > "$helper_tmp"
 chmod 700 "$entry_tmp"
-chmod 600 "$helper_tmp"
-mv -f "$helper_tmp" "$HELPER_TARGET"
 mv -f "$entry_tmp" "$ENTRY"
+# 升级时清理本工具旧版留下的数据工具；不接管同名文件或符号链接。
+legacy_helper="${RLM_HELPER_TARGET:-/usr/local/lib/realm-deploy/realm-data.py}"
+if [ -f "$legacy_helper" ] && [ ! -L "$legacy_helper" ] && grep -Fq '# Realm deploy data:' "$legacy_helper"; then
+  rm -f "$legacy_helper"
+fi
 printf '[+] 管理命令安装完成：%s\n' "$ENTRY"
 printf '%s\n' '以后输入 rnode 打开中文菜单；普通用户使用 sudo rnode。选择 1 即可创建转发。'
 # 运行刚安装的副本，确保移走下载文件夹后仍可使用。
-export RLM_HELPER_TARGET="$HELPER_TARGET"
 exec bash "$ENTRY" "$@"

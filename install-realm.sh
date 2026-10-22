@@ -31,14 +31,13 @@ fetch() {
   fi
 }
 printf '[+] 正在安装 Realm 中文转发管理：%s/%s（%s）\n' "$GITHUB_OWNER" "$GITHUB_REPO" "$GITHUB_REF"
-for filename in install.sh realm.sh realm-data.py; do
+for filename in install.sh realm.sh; do
   printf '[+] 正在下载 %s\n' "$filename"
   fetch "$base/$filename" "$temporary/$filename" || error "下载 $filename 失败，请检查仓库、分支、子目录和网络。"
   [ -s "$temporary/$filename" ] || error "下载到的 $filename 为空。"
 done
 grep -Fq '# Realm deploy installer:' "$temporary/install.sh" || error '安装入口内容不符合预期。'
 grep -Fq '# Realm deploy manager:' "$temporary/realm.sh" || error '管理脚本内容不符合预期。'
-grep -Fq '# Realm deploy data:' "$temporary/realm-data.py" || error '数据工具内容不符合预期。'
 printf '%s\n' '[+] 下载完成，安装后自动打开中文菜单。'
 if [ "$(id -u)" -eq 0 ]; then
   sh "$temporary/install.sh" "$@"

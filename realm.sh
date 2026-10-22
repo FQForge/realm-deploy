@@ -7,7 +7,6 @@ SERVICE_NAME=realm-deploy
 ETC_DIR="${RLM_ETC_DIR:-/etc/realm-deploy}"
 OPT_DIR="${RLM_OPT_DIR:-/opt/realm-deploy}"
 ENTRY="${RLM_ENTRY:-/usr/local/bin/rnode}"
-HELPER_TARGET="${RLM_HELPER_TARGET:-/usr/local/lib/realm-deploy/realm-data.py}"
 CORE_LINK="${RLM_CORE_LINK:-/usr/local/bin/realm-deploy-core}"
 UNIT_FILE="${RLM_UNIT_FILE:-/etc/systemd/system/realm-deploy.service}"
 OPENRC_FILE="${RLM_OPENRC_FILE:-/etc/init.d/realm-deploy}"
@@ -16,9 +15,6 @@ STATE="$ETC_DIR/rules.json"
 CONFIG="$ETC_DIR/config.toml"
 BACKUPS="$ETC_DIR/backups"
 VERSIONS="$OPT_DIR/versions"
-SOURCE_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DATA_TOOL="${RLM_DATA_TOOL:-$SOURCE_DIR/realm-data.py}"
-[[ -f "$DATA_TOOL" ]] || DATA_TOOL="$HELPER_TARGET"
 INIT_SYSTEM=''
 DISTRO_NAME=unknown
 API='https://api.github.com/repos/zhboner/realm/releases'
@@ -27,7 +23,6 @@ say() { printf '%s\n' "$*"; }
 info() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 fail() { warn "$*"; return 1; }
-data() { python3 "$DATA_TOOL" "$@"; }
 
 color() {
   if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR+x}" ]]; then
@@ -39,6 +34,395 @@ color() {
 title() { say ''; color '1;36' "━━━━━━━━━━ $* ━━━━━━━━━━"; say ''; }
 item() { printf '  %s）%s\n' "$1" "$2"; }
 require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || fail '请使用 root，或在命令前加 sudo。'; }
+
+# 数据只交给 jq 解析，不 source 配置文件，也不把用户输入作为命令执行。
+normalize_ipv4() {
+  local value="$1" part
+  local -a parts=()
+  [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r -a parts <<< "$value"
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((10#$part <= 255)) || return 1
+  done
+  ((10#${parts[0]} < 224 || 10#${parts[0]} > 239)) || return 1
+  printf '%s\n' "$value"
+}
+
+normalize_ipv6() {
+  local value="${1,,}" left right part tail prefix expanded='' result='' index start=-1 length=0 best=-1 longest=1 missing
+  local -a before=() after=() groups=() octets=()
+  if [[ "$value" == *.* ]]; then
+    tail=$(normalize_ipv4 "${value##*:}") || return 1
+    IFS=. read -r -a octets <<< "$tail"
+    printf -v tail '%x:%x' "$((10#${octets[0]}*256+10#${octets[1]}))" "$((10#${octets[2]}*256+10#${octets[3]}))"
+    value="${value%:*}:$tail"
+  fi
+  [[ "$value" =~ ^[0-9a-f:]+$ && "$value" != *:::* ]] || return 1
+  if [[ "$value" == *::* ]]; then
+    left="${value%%::*}"; right="${value#*::}"
+    [[ "$right" != *::* && "$right" != *: ]] || return 1
+    [[ -z "$left" ]] || IFS=: read -r -a before <<< "$left"
+    [[ -z "$right" ]] || IFS=: read -r -a after <<< "$right"
+    missing=$((8-${#before[@]}-${#after[@]}))
+    ((missing >= 1)) || return 1
+    groups=("${before[@]}")
+    for ((index=0; index<missing; index++)); do groups+=(0); done
+    groups+=("${after[@]}")
+  else
+    [[ "$value" != :* && "$value" != *: ]] || return 1
+    IFS=: read -r -a groups <<< "$value"
+    ((${#groups[@]} == 8)) || return 1
+  fi
+  for index in "${!groups[@]}"; do
+    part="${groups[index]}"
+    [[ "$part" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+    printf -v 'groups[index]' '%x' "$((16#$part))"
+    if [[ "${groups[index]}" == 0 ]]; then
+      ((start >= 0)) || start=$index
+      length=$((index-start+1))
+      if ((length > longest)); then best=$start; longest=$length; fi
+    else start=-1
+    fi
+  done
+  ((16#${groups[0]} < 65280)) || return 1
+  for ((index=0; index<8; index++)); do
+    if ((index == best)); then
+      result+='::'
+      index=$((index+longest-1))
+    else
+      [[ -z "$result" || "$result" == *: ]] || result+=:
+      result+="${groups[index]}"
+    fi
+  done
+  # 保留一份展开格式给 /proc/net 地址转换使用。
+  for part in "${groups[@]}"; do printf -v prefix '%04x' "$((16#$part))"; expanded+="$prefix"; done
+  if [[ "${2:-}" == expanded ]]; then printf '%s\n' "$expanded"; else printf '%s\n' "$result"; fi
+}
+
+normalize_host() {
+  local value="$1" kind="${2:-host}" normalized label
+  local -a labels=()
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "$kind" == public && -z "$value" ]]; then say ''; return 0; fi
+  if [[ "$value" == '['*']' ]]; then value="${value:1:${#value}-2}"; fi
+  [[ "$value" =~ ^[a-zA-Z0-9:._-]+$ ]] || {
+    fail '请输入 IP 或域名，不带 https://、端口、路径或空格；中文域名请使用 Punycode。'; return 1;
+  }
+  if [[ "$value" == *:* ]]; then
+    normalized=$(normalize_ipv6 "$value") || { fail 'IPv6 地址格式有误，请不要带端口或区域编号。'; return 1; }
+  elif [[ "$value" =~ ^[0-9.]+$ ]]; then
+    normalized=$(normalize_ipv4 "$value") || { fail 'IPv4 地址格式有误，例如 203.0.113.10。'; return 1; }
+  else
+    [[ "$kind" != listen ]] || { fail '监听地址必须是本机 IP，例如 0.0.0.0 或 ::。'; return 1; }
+    value="${value,,}"; value="${value%.}"
+    [[ -n "$value" && ${#value} -le 253 && "$value" != .* && "$value" != *. ]] || { fail 'IP / 域名格式有误。'; return 1; }
+    IFS=. read -r -a labels <<< "$value"
+    for label in "${labels[@]}"; do
+      [[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || {
+        fail '请输入 IP 或域名，不带 https://、端口、路径或空格；中文域名请使用 Punycode。'; return 1;
+      }
+    done
+    normalized="$value"
+  fi
+  if [[ "$kind" != listen && ( "$normalized" == 0.0.0.0 || "$normalized" == :: ) ]]; then
+    fail '目标或公网地址不能填写 0.0.0.0 / ::，请填写实际 IP 或域名。'; return 1
+  fi
+  say "$normalized"
+}
+
+data_field() {
+  local kind="$1" value="$2"
+  case "$kind" in
+    port)
+      if ! { [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value >= 1 && 10#$value <= 65535)); }; then
+        fail '端口请输入 1～65535 之间的整数。'; return 1;
+      fi
+      printf '%s\n' "$((10#$value))" ;;
+    name)
+      value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
+      jq -en --arg value "$value" '$value | length >= 1 and length <= 48 and all(explode[]; . >= 32 and (. < 127 or . > 159))' >/dev/null || {
+        fail '名称请输入 1～48 个字符，不能包含控制字符。'; return 1;
+      }
+      say "$value" ;;
+    version)
+      [[ "$value" =~ ^v?[0-9]+(\.[0-9]+){1,3}(-[a-zA-Z0-9.-]+)?$ ]] || {
+        fail '版本格式有误，例如 v2.7.0。'; return 1;
+      }
+      say "$value" ;;
+    host|public|listen) normalize_host "$value" "$kind" ;;
+    *) fail '未知的输入类型。'; return 1 ;;
+  esac
+}
+
+data_validate() {
+  local file="$1" kind value normalized size
+  [[ -f "$file" ]] || { fail '没有找到规则 JSON 文件。'; return 1; }
+  size=$(wc -c < "$file") || return 1
+  ((size <= 5242880)) || { fail '规则文件过大，最大支持 5 MiB。'; return 1; }
+  if ! jq -es '
+    def integer: type == "number" and floor == .;
+    def port: integer and . >= 1 and . <= 65535;
+    def rule:
+      type == "object" and keys == ["enabled","id","listen_host","listen_port","name","public_host","public_port","remote_host","remote_port"] and
+      (.id | integer and . >= 1 and . <= 2147483647) and
+      (.name | type == "string" and length >= 1 and length <= 48 and all(explode[]; . >= 32 and (. < 127 or . > 159))) and
+      all(.listen_host, .remote_host, .public_host; type == "string") and
+      all(.listen_port, .remote_port, .public_port; port) and (.enabled | type == "boolean") and
+      (if .enabled then
+        (((.remote_host == "localhost" or .remote_host == "::1" or (.remote_host | test("^127[.][0-9]+[.][0-9]+[.][0-9]+$")) or .remote_host == .listen_host) and .remote_port == .listen_port) | not) and
+        ((.remote_host == .public_host and .remote_port == .public_port) | not)
+       else true end);
+    length == 1 and (.[0] |
+      type == "object" and keys == ["rules","version"] and .version == 1 and
+      (.rules | type == "array" and length <= 1024) and all(.rules[]; rule) and
+      ([.rules[].id] | length == (unique | length)) and
+      ([.rules[].listen_port] | length == (unique | length)))
+  ' "$file" >/dev/null 2>&1; then
+    fail '规则 JSON 格式有误：请检查字段、端口、重复编号 / 监听端口，以及循环转发。'; return 1
+  fi
+  while IFS=$'\t' read -r kind value; do
+    normalized=$(data_field "$kind" "$value") || return 1
+    [[ "$value" == "$normalized" ]] || { fail '规则地址不是规范格式，请通过菜单重新填写。'; return 1; }
+  done < <(jq -r '.rules[] | ["listen",.listen_host], ["host",.remote_host], ["public",.public_host] | @tsv' "$file")
+}
+
+# 直接读取内核套接字表，不需要额外开启端口或运行后台探测进程。
+socket_snapshot() {
+  local mode="$1" protocol suffix file found=0
+  for protocol in tcp udp; do
+    for suffix in '' 6; do
+      file="/proc/net/$protocol$suffix"
+      [[ -r "$file" ]] || continue
+      found=1
+      awk -v protocol="$protocol" -v mode="$mode" 'NR > 1 && (mode != "listen" || protocol != "tcp" || $4 == "0A") { print protocol, $2 }' "$file" || return 1
+    done
+  done
+  ((found)) || { fail '无法读取 /proc/net，不能检查端口。'; return 1; }
+}
+
+ip_socket_hex() {
+  local address="$1" expanded='' part word order result='' index
+  local -a octets=()
+  if [[ "$address" == *:* ]]; then expanded=$(normalize_ipv6 "$address" expanded) || return 1
+  else
+    IFS=. read -r -a octets <<< "$address"
+    for part in "${octets[@]}"; do printf -v word '%02X' "$((10#$part))"; expanded+="$word"; done
+  fi
+  order=$(printf '\001\000' | od -An -tu2) || return 1
+  for ((index=0; index<${#expanded}; index+=8)); do
+    word="${expanded:index:8}"
+    if [[ "$order" =~ ^[[:space:]]*1[[:space:]]*$ ]]; then
+      word="${word:6:2}${word:4:2}${word:2:2}${word:0:2}"
+    fi
+    result+="$word"
+  done
+  say "${result^^}"
+}
+
+data_check_ports() {
+  local file="$1" old="$2" snapshot address number hex
+  snapshot=$(socket_snapshot all) || return 1
+  while IFS=$'\t' read -r address number; do
+    if jq -e --arg host "$address" --argjson port "$number" 'any(.rules[]; .enabled and .listen_host == $host and .listen_port == $port)' "$old" >/dev/null; then continue; fi
+    printf -v hex '%04X' "$number"
+    if [[ "$snapshot" == *":$hex"$'\n'* || "$snapshot" == *":$hex" ]]; then
+      fail "监听端口 $number 已有 TCP / UDP 连接占用，请换一个空闲端口。"; return 1
+    fi
+  done < <(jq -r '.rules[] | select(.enabled) | [.listen_host,.listen_port] | @tsv' "$file")
+}
+
+data_listening() {
+  local file="$1" snapshot address number hex address_hex protocol
+  snapshot=$(socket_snapshot listen) || return 1
+  snapshot=$'\n'"$snapshot"$'\n'
+  while IFS=$'\t' read -r address number; do
+    address_hex=$(ip_socket_hex "$address") || return 1
+    printf -v hex '%04X' "$number"
+    for protocol in tcp udp; do
+      [[ "$snapshot" == *$'\n'"$protocol $address_hex:$hex"$'\n'* ]] || return 1
+    done
+  done < <(jq -r '.rules[] | select(.enabled) | [.listen_host,.listen_port] | @tsv' "$file")
+}
+
+data_release() {
+  local file="$1" architecture="$2" tag target selected='' asset url digest checksum='' checksum_name prefix
+  local -a targets=()
+  jq -e 'type == "object" and (.assets | type == "array") and all(.assets[]; type == "object")' "$file" >/dev/null || {
+    fail 'GitHub 返回的发布信息格式有误，请检查 API 限流或稍后重试。'; return 1;
+  }
+  tag=$(jq -er '.tag_name | select(type == "string")' "$file") && data_field version "$tag" >/dev/null || return 1
+  case "$architecture" in
+    x86_64) targets=(x86_64-unknown-linux-musl x86_64-unknown-linux-gnu) ;;
+    aarch64) targets=(aarch64-unknown-linux-musl aarch64-unknown-linux-gnu) ;;
+    armv7l) targets=(armv7-unknown-linux-musleabihf armv7-unknown-linux-gnueabihf) ;;
+    armv6l) targets=(arm-unknown-linux-musleabihf arm-unknown-linux-musleabi) ;;
+    i686) targets=(i686-unknown-linux-musl i686-unknown-linux-gnu) ;;
+    riscv64) targets=(riscv64gc-unknown-linux-gnu) ;;
+  esac
+  for target in "${targets[@]}"; do
+    selected=$(jq -c --arg target "$target" --arg tag "$tag" '
+      first(.assets[] | select(.name == ("realm-"+$target+".tar.gz") or .name == ("realm-"+$tag+"-"+$target+".tar.gz") or .name == ("realm-"+($tag|ltrimstr("v"))+"-"+$target+".tar.gz"))) // empty
+    ' "$file") || return 1
+    [[ -z "$selected" ]] || break
+  done
+  [[ -n "$selected" ]] || { fail "Realm $tag 没有适用于 $architecture 的官方安装包，没有修改当前内核。"; return 1; }
+  asset=$(jq -r '.name' <<< "$selected")
+  url=$(jq -r '.browser_download_url' <<< "$selected")
+  prefix="https://github.com/zhboner/realm/releases/download/$tag/"
+  [[ "$url" == "$prefix$asset" ]] || { fail '下载链接不是预期的 Realm 官方发布地址。'; return 1; }
+  digest=$(jq -er '(.digest // "") | if type == "string" then . else error("invalid digest") end' <<< "$selected") || return 1
+  [[ -z "$digest" || "$digest" =~ ^sha256:[a-fA-F0-9]{64}$ ]] || { fail '官方 API 的文件校验字段格式有误。'; return 1; }
+  for checksum_name in "$asset.sha256" "$asset.sha256sum" "$asset.sha256.txt" SHA256SUMS SHA256SUMS.txt sha256sums.txt checksums.txt checksums.sha256; do
+    selected=$(jq -c --arg name "$checksum_name" 'first(.assets[] | select(.name == $name)) // empty' "$file") || return 1
+    if [[ -n "$selected" ]]; then
+      checksum=$(jq -r '.browser_download_url' <<< "$selected")
+      [[ "$checksum" == "$prefix$checksum_name" ]] || { fail '校验文件不是预期的 Realm 官方发布地址。'; return 1; }
+      break
+    fi
+  done
+  printf '%s\n' "$tag" "$url" "$asset" "${digest#sha256:}" "$checksum"
+}
+
+data_checksum() {
+  local file="$1" asset="$2" line hash filename
+  local gnu='^[[:space:]]*([a-fA-F0-9]{64})([[:space:]]+\*?(.+))?[[:space:]]*$'
+  local bsd='^SHA256[[:space:]]*\((.+)\)[[:space:]]*=[[:space:]]*([a-fA-F0-9]{64})[[:space:]]*$'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    if [[ "$line" =~ $gnu ]]; then
+      hash="${BASH_REMATCH[1]}"; filename="${BASH_REMATCH[3]:-}"
+      filename="${filename#./}"; filename="${filename%"${filename##*[![:space:]]}"}"
+      if [[ -z "$filename" || "$filename" == "$asset" ]]; then say "${hash,,}"; return 0; fi
+    elif [[ "$line" =~ $bsd && "${BASH_REMATCH[1]}" == "$asset" ]]; then
+      say "${BASH_REMATCH[2],,}"; return 0
+    fi
+  done < "$file"
+  fail '校验文件中没有找到对应安装包的 SHA256。'
+}
+
+data_archive_member() {
+  local line selected='' count=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "${line##*/}" == realm && "$line" != /* && "/$line/" != */../* ]] || continue
+    selected="$line"; count=$((count+1))
+  done < "$1"
+  ((count == 1)) || { fail '安装包中未找到唯一的 realm 可执行文件。'; return 1; }
+  say "$selected"
+}
+
+tcp_probe() {
+  # 位置参数在受超时限制的子 Shell 中展开。
+  # shellcheck disable=SC2016
+  timeout 6 bash -c 'exec 3<>"/dev/tcp/$1/$2"' realm-probe "$1" "$2" 9>&- 2>/dev/null
+}
+
+data_diagnose() {
+  local file="$1" rule_id local_host failures=0
+  local -a fields=()
+  while IFS= read -r rule_id; do
+    mapfile -t fields < <(data get "$file" "$rule_id")
+    if [[ "${fields[7]}" != true ]]; then say "[跳过] #$rule_id ${fields[0]}：规则已停用。"; continue; fi
+    say "检查 #$rule_id ${fields[0]}："
+    if tcp_probe "${fields[3]}" "${fields[4]}"; then
+      say '[通过] 目标 TCP 可达（域名已完成解析）。'
+    else
+      say '[失败] 无法连接目标 TCP，请检查目标地址、DNS、端口和防火墙。'; failures=$((failures+1))
+    fi
+    local_host="${fields[1]}"
+    case "$local_host" in 0.0.0.0) local_host=127.0.0.1 ;; ::) local_host=::1 ;; esac
+    if tcp_probe "$local_host" "${fields[2]}"; then
+      say '[通过] 本机入口 TCP 正在接受连接。'
+    else
+      say '[失败] 本机入口连接失败，请查看服务日志。'; failures=$((failures+1))
+    fi
+  done < <(jq -r '.rules[].id' "$file")
+  say 'TCP 连接检查不代表协议握手通过；UDP 请用真实客户端验证。'
+  say '公网安全组、防火墙和 NAT 映射也需要正确配置。'
+  ((failures == 0))
+}
+
+data() {
+  local command="$1" file rule_id json rule_name listen_host listen_port remote_host remote_port public_host public_port enabled snapshot number hex attempt
+  shift
+  case "$command" in
+    field) data_field "$@"; return $? ;;
+    release) data_release "$@"; return $? ;;
+    checksum) data_checksum "$@"; return $? ;;
+    archive-member) data_archive_member "$@"; return $? ;;
+    sha256) sha256sum -- "$1" | awk '{ print $1 }'; return $? ;;
+    init) printf '%s\n' '{"version":1,"rules":[]}' > "$1"; return $? ;;
+  esac
+  file="$1"; shift
+  data_validate "$file" || return 1
+  case "$command" in
+    validate) return 0 ;;
+    render)
+      jq -r '
+        def ep($h;$p): (if $h | contains(":") then "["+$h+"]" else $h end)+":"+($p|tostring);
+        ["# RLM-MANAGED: realm-deploy; 修改请使用 rnode，直接修改会被覆盖。", "[log]", "level = \"warn\"", "", "[network]", "no_tcp = false", "use_udp = true", "",
+         (.rules[] | select(.enabled) | "# rule \(.id)", "[[endpoints]]", ("listen = "+(ep(.listen_host;.listen_port)|tojson)), ("remote = "+(ep(.remote_host;.remote_port)|tojson)), "") ] | join("\n")
+      ' "$file" > "$1" ;;
+    count)
+      if [[ "${1:-}" == enabled ]]; then jq '[.rules[] | select(.enabled)] | length' "$file"
+      else jq '.rules | length' "$file"; fi ;;
+    next-id) jq '([.rules[].id] | max // 0)+1' "$file" ;;
+    list)
+      jq -r '
+        def ep($h;$p): (if $h | contains(":") then "["+$h+"]" else $h end)+":"+($p|tostring);
+        if .rules | length == 0 then "还没有转发规则。主菜单选择 1 即可创建。"
+        else .rules[] | "\(.id)）\(.name) [\(if .enabled then "启用" else "停用" end)]  \(ep(.listen_host;.listen_port)) → \(ep(.remote_host;.remote_port))  TCP+UDP" end
+      ' "$file" ;;
+    get|show)
+      rule_id="$1"
+      json=$(jq -ec --arg id "$rule_id" 'first(.rules[] | select((.id|tostring) == $id)) // empty' "$file") || { fail '没有找到这个规则编号，请先查看规则列表。'; return 1; }
+      if [[ "$command" == get ]]; then
+        jq -r '.name,.listen_host,(.listen_port|tostring),.remote_host,(.remote_port|tostring),.public_host,(.public_port|tostring),(.enabled|tostring)' <<< "$json"
+      else
+        jq -r '
+          def ep($h;$p): (if $h | contains(":") then "["+$h+"]" else $h end)+":"+($p|tostring);
+          "", "规则编号：\(.id)　名称：\(.name)　状态：\(if .enabled then "启用" else "停用" end)",
+          "客户端 → \(ep((if .public_host == "" then "这台转发服务器的公网IP" else .public_host end);.public_port)) → \(ep(.remote_host;.remote_port))",
+          "本机监听：\(ep(.listen_host;.listen_port))（TCP + UDP）",
+          "客户端服务器地址：\(if .public_host == "" then "请填写这台转发服务器的公网 IP / 域名" else .public_host end)",
+          "客户端服务器端口：\(.public_port)", "其他参数：沿用目标节点的协议、密码 / UUID、加密、Reality 公钥、SNI 等。",
+          (if .listen_port != .public_port then "NAT 映射需自行配置：公网 \(.public_port) → 本机 \(.listen_port)（TCP + UDP）。" else empty end),
+          "本机防火墙：放行 \(.listen_port) 的 TCP + UDP；公网安全组 / 上游防火墙：放行 \(.public_port)。"
+        ' <<< "$json"
+      fi ;;
+    put)
+      rule_id="$2"
+      if ! { [[ "$rule_id" =~ ^[1-9][0-9]{0,9}$ ]] && ((rule_id <= 2147483647)); }; then fail '规则编号无效。'; return 1; fi
+      rule_name=$(data_field name "$3") && listen_host=$(data_field listen "$4") && listen_port=$(data_field port "$5") &&
+        remote_host=$(data_field host "$6") && remote_port=$(data_field port "$7") && public_host=$(data_field public "$8") && public_port=$(data_field port "$9") || return 1
+      enabled="${10}"
+      [[ "$enabled" == true || "$enabled" == false ]] || { fail '规则启停状态无效。'; return 1; }
+      jq --argjson id "$rule_id" --arg name "$rule_name" --arg lh "$listen_host" --argjson lp "$listen_port" --arg rh "$remote_host" --argjson rp "$remote_port" --arg ph "$public_host" --argjson pp "$public_port" --argjson enabled "$enabled" '
+        .rules = ([.rules[] | select(.id != $id)] + [{id:$id,name:$name,listen_host:$lh,listen_port:$lp,remote_host:$rh,remote_port:$rp,public_host:$ph,public_port:$pp,enabled:$enabled}] | sort_by(.id))
+      ' "$file" > "$1" && data_validate "$1" ;;
+    remove|toggle)
+      data get "$file" "$2" >/dev/null || return 1
+      if [[ "$command" == remove ]]; then
+        jq --arg id "$2" '.rules |= map(select((.id|tostring) != $id))' "$file" > "$1"
+      else
+        jq --arg id "$2" '(.rules[] | select((.id|tostring) == $id) | .enabled) |= not' "$file" > "$1"
+      fi && data_validate "$1" ;;
+    check-ports) data_validate "$1" && data_check_ports "$file" "$1" ;;
+    listening) data_listening "$file" ;;
+    auto-port)
+      data_field listen "$1" >/dev/null || return 1
+      snapshot=$(socket_snapshot all) || return 1
+      for ((attempt=0; attempt<128; attempt++)); do
+        number=$((20000+((RANDOM*32768+RANDOM)%40001)))
+        if jq -e --argjson port "$number" 'any(.rules[]; .listen_port == $port)' "$file" >/dev/null; then continue; fi
+        printf -v hex '%04X' "$number"
+        if [[ "$snapshot" != *":$hex"$'\n'* && "$snapshot" != *":$hex" ]]; then say "$number"; return 0; fi
+      done
+      fail '未找到空闲端口，请手动填写。' ;;
+    diagnose) data_diagnose "$file" ;;
+    *) fail '未知的数据操作。'; return 1 ;;
+  esac
+}
 
 detect_system() {
   local pid1=''
@@ -74,7 +458,7 @@ need_service_manager() {
 ensure_dependencies() {
   local command_name package manager=''
   local -a missing=() packages=(ca-certificates)
-  for command_name in python3 curl tar gzip flock; do
+  for command_name in jq curl tar gzip flock timeout sha256sum od; do
     command -v "$command_name" >/dev/null || missing+=("$command_name")
   done
   if ((${#missing[@]})); then
@@ -90,6 +474,7 @@ ensure_dependencies() {
     for command_name in "${missing[@]}"; do
       package="$command_name"
       [[ "$command_name" != flock ]] || package=util-linux
+      case "$command_name" in timeout|sha256sum|od) package=coreutils ;; esac
       packages+=("$package")
     done
     info "正在安装必要工具：${missing[*]}。请等待软件包管理器完成。"
@@ -101,20 +486,14 @@ ensure_dependencies() {
       pacman) pacman -S --noconfirm --needed "${packages[@]}" || return 1 ;;
     esac
   fi
-  for command_name in python3 curl tar gzip flock; do
+  for command_name in jq curl tar gzip flock timeout sha256sum od; do
     command -v "$command_name" >/dev/null || { fail "仍缺少 $command_name，请检查系统软件源。"; return 1; }
   done
-  python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || {
-    fail '需要 Python 3.9 或更新版本，推荐使用 Debian 12 / Ubuntu 22.04 及更新系统。'; return 1;
-  }
-  if [[ ! -f "$DATA_TOOL" ]] || ! grep -Fq '# Realm deploy data:' "$DATA_TOOL"; then
-    fail '未找到配套 realm-data.py。请重新执行 README 中的一键安装命令，或从完整文件夹运行 sh install.sh。'; return 1;
-  fi
 }
 
 check_paths() {
   local path
-  for path in "$ETC_DIR" "$OPT_DIR" "$ENTRY" "$HELPER_TARGET" "$CORE_LINK" "$UNIT_FILE" "$OPENRC_FILE" "$LOG_FILE"; do
+  for path in "$ETC_DIR" "$OPT_DIR" "$ENTRY" "$CORE_LINK" "$UNIT_FILE" "$OPENRC_FILE" "$LOG_FILE"; do
     [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ && "$path" != / && "$path" != */../* && "$path" != */.. ]] || {
       fail "安装路径必须为普通的绝对路径：$path"; return 1;
     }
@@ -680,7 +1059,7 @@ check_system() {
   say "Linux 系统：$DISTRO_NAME"
   say "CPU 架构：$(uname -m)；内核包以 Realm 官方实际发布为准。"
   say "服务管理器：$INIT_SYSTEM"
-  for command_name in bash python3 curl tar gzip flock; do
+  for command_name in bash jq curl tar gzip flock timeout sha256sum od; do
     if command -v "$command_name" >/dev/null; then say "[通过] $command_name"
     else warn "缺少 $command_name；安装时将尝试自动补齐。"; missing_count=1
     fi
@@ -693,7 +1072,7 @@ check_system() {
 uninstall() {
   local answer backup_copy
   managed_file "$UNIT_FILE" '# RLM-MANAGED: realm-deploy' && managed_file "$OPENRC_FILE" '# RLM-MANAGED: realm-deploy' || return 1
-  managed_file "$ENTRY" '# Realm deploy manager:' && managed_file "$HELPER_TARGET" '# Realm deploy data:' || return 1
+  managed_file "$ENTRY" '# Realm deploy manager:' || return 1
   check_core_link || return 1
   say '这将停止全部转发，删除本工具的服务、内核、配置、内部备份及 rnode 命令。'
   say '确认后会在配置目录旁保留最后一份规则 JSON；原始下载文件夹保留。'
@@ -702,7 +1081,7 @@ uninstall() {
   backup_copy=$(mktemp "$(dirname "$ETC_DIR")/realm-deploy-backup-$(date +%Y%m%d-%H%M%S)-XXXXXX.json") || return 1
   cp "$STATE" "$backup_copy" && chmod 600 "$backup_copy" || return 1
   service_stop && service_disable || return 1
-  rm -f "$UNIT_FILE" "$OPENRC_FILE" "$CORE_LINK" "$ENTRY" "$HELPER_TARGET" || return 1
+  rm -f "$UNIT_FILE" "$OPENRC_FILE" "$CORE_LINK" "$ENTRY" || return 1
   if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload 9>&- || return 1; fi
   rm -rf "$ETC_DIR" "$OPT_DIR" || return 1
   info "卸载完成。最后的规则备份保存在：$backup_copy"
