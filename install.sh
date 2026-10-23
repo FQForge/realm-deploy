@@ -14,7 +14,7 @@ grep -Fq '# Realm deploy manager:' "$SCRIPT" || error 'realm.sh 文件标记不�
 
 if ! command -v bash >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash
   elif command -v dnf >/dev/null 2>&1; then dnf install -y bash
   elif command -v yum >/dev/null 2>&1; then yum install -y bash
   elif command -v apk >/dev/null 2>&1; then apk add --no-cache bash

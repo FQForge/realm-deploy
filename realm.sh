@@ -13,6 +13,7 @@ OPENRC_FILE="${RLM_OPENRC_FILE:-/etc/init.d/realm-deploy}"
 LOG_FILE="${RLM_LOG_FILE:-/var/log/realm-deploy.log}"
 STATE="$ETC_DIR/rules.json"
 CONFIG="$ETC_DIR/config.toml"
+LOG_SETTING="$ETC_DIR/logging"
 BACKUPS="$ETC_DIR/backups"
 VERSIONS="$OPT_DIR/versions"
 INIT_SYSTEM=''
@@ -319,7 +320,7 @@ data_listening() {
 }
 
 data_release() {
-  local file="$1" architecture="$2" tag target selected='' asset url digest checksum='' checksum_name prefix
+  local file="$1" architecture="$2" tag target flavor selected='' asset url digest checksum='' checksum_name prefix
   local -a targets=()
   jq -e 'type == "object" and (.assets | type == "array") and all(.assets[]; type == "object")' "$file" >/dev/null || {
     fail 'GitHub 返回的发布信息格式有误，请检查 API 限流或稍后重试。'; return 1;
@@ -333,11 +334,14 @@ data_release() {
     i686) targets=(i686-unknown-linux-musl i686-unknown-linux-gnu) ;;
     riscv64) targets=(riscv64gc-unknown-linux-gnu) ;;
   esac
+  # Slim 保留 TCP / UDP、DNS 和多线程；旧版本没有 Slim 时仍使用标准包。
   for target in "${targets[@]}"; do
-    selected=$(jq -c --arg target "$target" --arg tag "$tag" '
-      first(.assets[] | select(.name == ("realm-"+$target+".tar.gz") or .name == ("realm-"+$tag+"-"+$target+".tar.gz") or .name == ("realm-"+($tag|ltrimstr("v"))+"-"+$target+".tar.gz"))) // empty
-    ' "$file") || return 1
-    [[ -z "$selected" ]] || break
+    for flavor in realm-slim realm; do
+      selected=$(jq -c --arg flavor "$flavor" --arg target "$target" --arg tag "$tag" '
+        first(.assets[] | select(.name == ($flavor+"-"+$target+".tar.gz") or .name == ($flavor+"-"+$tag+"-"+$target+".tar.gz") or .name == ($flavor+"-"+($tag|ltrimstr("v"))+"-"+$target+".tar.gz"))) // empty
+      ' "$file") || return 1
+      [[ -z "$selected" ]] || break 2
+    done
   done
   [[ -n "$selected" ]] || { fail "Realm $tag 没有适用于 $architecture 的官方安装包，没有修改当前内核。"; return 1; }
   asset=$(jq -r '.name' <<< "$selected")
@@ -375,12 +379,12 @@ data_checksum() {
 }
 
 data_archive_member() {
-  local line selected='' count=0
+  local line selected='' count=0 executable="${2:-realm}"
   while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "${line##*/}" == realm && "$line" != /* && "/$line/" != */../* ]] || continue
+    [[ "${line##*/}" == "$executable" && "$line" != /* && "/$line/" != */../* ]] || continue
     selected="$line"; count=$((count+1))
   done < "$1"
-  ((count == 1)) || { fail '安装包中未找到唯一的 realm 可执行文件。'; return 1; }
+  ((count == 1)) || { fail "安装包中未找到唯一的 $executable 可执行文件。"; return 1; }
   say "$selected"
 }
 
@@ -431,9 +435,11 @@ data() {
   case "$command" in
     validate) return 0 ;;
     render)
-      jq -r '
+      local log_level=off
+      if logging_enabled; then log_level=warn; fi
+      jq -r --arg level "$log_level" '
         def ep($h;$p): (if $h | contains(":") then "["+$h+"]" else $h end)+":"+($p|tostring);
-        ["# RLM-MANAGED: realm-deploy; 修改请使用 rnode，直接修改会被覆盖。", "[log]", "level = \"warn\"", "", "[network]", "no_tcp = false", "use_udp = true", "",
+        ["# RLM-MANAGED: realm-deploy; 修改请使用 rnode，直接修改会被覆盖。", "[log]", ("level = "+($level|tojson)), "output = \"stdout\"", "", "[network]", "no_tcp = false", "use_udp = true", "",
          (.rules[] | select(.enabled) | "# rule \(.id)", "[[endpoints]]", ("listen = "+(ep(.listen_host;.listen_port)|tojson)), ("remote = "+(ep(.remote_host;.remote_port)|tojson)), "") ] | join("\n")
       ' "$file" > "$1" ;;
     count)
@@ -596,7 +602,7 @@ init_data() {
   local path allow_broken="${1:-0}"
   check_paths || return 1
   owned_dir "$ETC_DIR" && owned_dir "$OPT_DIR" || return 1
-  for path in "$BACKUPS" "$VERSIONS" "$STATE" "$CONFIG" "$ETC_DIR/.lock"; do
+  for path in "$BACKUPS" "$VERSIONS" "$STATE" "$CONFIG" "$LOG_SETTING" "$ETC_DIR/.lock"; do
     [[ ! -L "$path" ]] || { fail "发现符号链接，拒绝写入：$path"; return 1; }
   done
   mkdir -p "$BACKUPS" "$VERSIONS" || return 1
@@ -604,6 +610,11 @@ init_data() {
   # 锁由管理进程持有。调用服务管理器和内核时关闭 FD 9，避免后台进程继承锁。
   exec 9>"$ETC_DIR/.lock"
   flock -n 9 || { fail '另一个 rnode 管理窗口正在操作，请先退出那个窗口。'; return 1; }
+  if [[ -e "$LOG_SETTING" ]]; then
+    [[ -f "$LOG_SETTING" ]] && [[ $(<"$LOG_SETTING") == on || $(<"$LOG_SETTING") == off ]] || {
+      fail "日志设置格式有误：$LOG_SETTING（只接受 on / off）。"; return 1;
+    }
+  fi
   if [[ ! -e "$STATE" ]]; then data init "$STATE" || return 1; fi
   if ! data validate "$STATE"; then
     if [[ "$allow_broken" == 1 ]]; then
@@ -611,7 +622,12 @@ init_data() {
     else
       fail "现有规则文件损坏。请执行 sudo rnode restore $BACKUPS/有效备份.json 恢复。"; return 1
     fi
-  elif [[ ! -e "$CONFIG" ]]; then data render "$STATE" "$CONFIG" || return 1
+  else
+    if [[ ! -e "$CONFIG" ]]; then data render "$STATE" "$CONFIG" || return 1; fi
+    # 首次安装或从旧版升级时关闭日志；之后保留用户在菜单中的选择。
+    if [[ ! -e "$LOG_SETTING" ]]; then set_logging off quiet || return 1; fi
+    prune_core_versions || return 1
+    prune_auto_backups || return 1
   fi
 }
 
@@ -633,8 +649,11 @@ check_core_link() {
   }
 }
 
+logging_enabled() { [[ -f "$LOG_SETTING" && $(<"$LOG_SETTING") == on ]]; }
+
 install_service() {
-  local service_tmp
+  local service_tmp output=null file_output=/dev/null
+  if logging_enabled; then output=journal; file_output="$LOG_FILE"; fi
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     managed_file "$UNIT_FILE" '# RLM-MANAGED: realm-deploy' || return 1
     mkdir -p "$(dirname "$UNIT_FILE")" || return 1
@@ -651,6 +670,11 @@ Type=simple
 ExecStart="$CORE_LINK" -c "$CONFIG"
 Restart=on-failure
 RestartSec=3
+StandardOutput=$output
+StandardError=$output
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+LimitCORE=0
 LimitNOFILE=1048576
 NoNewPrivileges=true
 PrivateTmp=true
@@ -668,8 +692,11 @@ EOF
     systemctl daemon-reload 9>&- || return 1
   else
     managed_file "$OPENRC_FILE" '# RLM-MANAGED: realm-deploy' || return 1
-    [[ ! -L "$LOG_FILE" ]] || { fail "日志路径不能是符号链接：$LOG_FILE"; return 1; }
-    mkdir -p "$(dirname "$OPENRC_FILE")" "$(dirname "$LOG_FILE")" || return 1
+    if logging_enabled; then
+      [[ ! -L "$LOG_FILE" && ( ! -e "$LOG_FILE" || -f "$LOG_FILE" ) ]] || { fail "日志路径必须是普通文件：$LOG_FILE"; return 1; }
+      mkdir -p "$(dirname "$LOG_FILE")" || return 1
+    fi
+    mkdir -p "$(dirname "$OPENRC_FILE")" || return 1
     service_tmp=$(mktemp "$(dirname "$OPENRC_FILE")/.realm-service.XXXXXX") || return 1
     if ! cat > "$service_tmp" <<EOF
 #!/sbin/openrc-run
@@ -679,8 +706,9 @@ command="$CORE_LINK"
 command_args="-c $CONFIG"
 supervisor="supervise-daemon"
 pidfile="/run/realm-deploy.pid"
-output_log="$LOG_FILE"
-error_log="$LOG_FILE"
+output_log="$file_output"
+error_log="$file_output"
+rc_ulimit="-c 0"
 respawn_delay=3
 respawn_max=5
 respawn_period=60
@@ -746,6 +774,10 @@ wait_service() {
 }
 
 show_logs() {
+  if ! logging_enabled; then
+    say 'Realm 日志已关闭；排障时可在菜单 5 → 6 开启，或执行 rnode logs on。'
+    say '以下仅显示已有历史日志（如有）。'
+  fi
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     journalctl -u "$SERVICE_NAME.service" -n 60 --no-pager 9>&-
   elif [[ -f "$LOG_FILE" ]]; then tail -n 60 "$LOG_FILE"
@@ -753,12 +785,100 @@ show_logs() {
   fi
 }
 
+set_logging() (
+  local mode="$1" quiet="${2:-}" temporary service_file active=0 committed=0 done=0
+  [[ "$mode" == on || "$mode" == off ]] || { fail '用法：rnode logs [on|off]'; exit 1; }
+  if [[ "$INIT_SYSTEM" == systemd ]]; then service_file="$UNIT_FILE"; else service_file="$OPENRC_FILE"; fi
+  managed_file "$CONFIG" '# RLM-MANAGED: realm-deploy' && managed_file "$service_file" '# RLM-MANAGED: realm-deploy' || exit 1
+  temporary=$(mktemp -d "$ETC_DIR/.logging.XXXXXX") || exit 1
+  cleanup_logging() {
+    local result=$?
+    trap - EXIT
+    if ((committed && !done)); then
+      warn '日志设置应用失败，正在恢复原来的设置和服务。'
+      cp "$temporary/config" "$CONFIG" || warn '恢复配置失败。'
+      if [[ -f "$temporary/setting" ]]; then cp "$temporary/setting" "$LOG_SETTING" || warn '恢复日志开关失败。'
+      else rm -f "$LOG_SETTING"
+      fi
+      if [[ -f "$temporary/service" ]]; then
+        cp "$temporary/service" "$service_file" || warn '恢复服务文件失败。'
+        if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload 9>&- || true; fi
+      fi
+      (( !active )) || service_restart || warn '恢复服务失败，请执行 rnode diagnose。'
+    fi
+    rm -rf "$temporary"
+    return "$result"
+  }
+  trap cleanup_logging EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  cp "$CONFIG" "$temporary/config" || exit 1
+  if [[ -f "$LOG_SETTING" ]]; then cp "$LOG_SETTING" "$temporary/setting" || exit 1; fi
+  if service_exists; then cp "$service_file" "$temporary/service" || exit 1; fi
+  if service_active; then active=1; fi
+  printf '%s\n' "$mode" > "$temporary/new-setting" || exit 1
+  committed=1
+  mv -f "$temporary/new-setting" "$LOG_SETTING" || exit 1
+  data render "$STATE" "$temporary/new-config" && mv -f "$temporary/new-config" "$CONFIG" || exit 1
+  if [[ -f "$temporary/service" ]]; then install_service || exit 1; fi
+  if ((active)); then service_restart && wait_service || exit 1; fi
+  done=1
+  # 只清空本工具以前的独立日志，不清理共享的 systemd journal。
+  if [[ "$mode" == off && -f "$LOG_FILE" && ! -L "$LOG_FILE" ]]; then
+    : > "$LOG_FILE" || warn '旧日志文件未能清空。'
+  fi
+  if [[ "$quiet" != quiet ]]; then
+    if [[ "$mode" == on ]]; then info '日志已开启（warn）；排障完成后请关闭。'
+    else info 'Realm 日志已关闭，旧的独立日志文件已清空。'
+    fi
+    (( !active )) || say '服务已重启，现有连接可能需要重新连接。'
+  fi
+)
+
+prune_core_versions() {
+  local current previous="${1:-}" directory name
+  [[ -L "$CORE_LINK" ]] || return 0
+  check_core_link || return 1
+  current=$(readlink "$CORE_LINK") || return 1
+  [[ -x "$current" ]] || return 0
+  [[ "$previous" != "$current" ]] || previous=''
+  # 保留正在使用的内核及一个回滚版本；只删除本工具目录内的已知二进制。
+  if [[ -z "$previous" ]]; then
+    for directory in "$VERSIONS/"*; do
+      name="${directory##*/}"; name="${name#slim-}"
+      [[ "$name" =~ ^v?[0-9]+(\.[0-9]+){1,3}(-[a-zA-Z0-9.-]+)?$ && -d "$directory" && ! -L "$directory" && -f "$directory/realm" && ! -L "$directory/realm" && "$directory/realm" != "$current" ]] || continue
+      if [[ -z "$previous" || "$directory/realm" -nt "$previous" ]]; then previous="$directory/realm"; fi
+    done
+  fi
+  for directory in "$VERSIONS/"*; do
+    name="${directory##*/}"; name="${name#slim-}"
+    [[ "$name" =~ ^v?[0-9]+(\.[0-9]+){1,3}(-[a-zA-Z0-9.-]+)?$ && -d "$directory" && ! -L "$directory" && -f "$directory/realm" && ! -L "$directory/realm" ]] || continue
+    [[ "$directory/realm" != "$current" && "$directory/realm" != "$previous" ]] || continue
+    rm -f -- "$directory/realm" || return 1
+    rmdir -- "$directory" 2>/dev/null || true
+  done
+}
+
+prune_auto_backups() {
+  local path count=0
+  local -a files=()
+  for path in "$BACKUPS/"auto-*.json; do
+    [[ "${path##*/}" =~ ^auto-[0-9]{8}-[0-9]{6}-[a-zA-Z0-9]{6}\.json$ && -f "$path" && ! -L "$path" ]] || continue
+    files+=("$path")
+  done
+  ((${#files[@]} > 10)) || return 0
+  while IFS= read -r path; do
+    count=$((count+1))
+    if ((count > 10)); then rm -f -- "$path" || return 1; fi
+  done < <(LC_ALL=C ls -1t -- "${files[@]}")
+}
+
 fetch() {
   curl --proto '=https' --tlsv1.2 -fLsS --retry 2 --connect-timeout 10 --max-time 180 -o "$2" "$1"
 }
 
 install_core() (
-  local requested="${1:-latest}" temporary tag url asset expected manifest member target old='' link_tmp detected
+  local requested="${1:-latest}" temporary tag url asset expected manifest member target old='' link_tmp detected executable=realm
   local was_active=0 changed=0 done=0
   local -a release_info=()
   check_core_link || exit 1
@@ -799,6 +919,7 @@ install_core() (
   tag="${release_info[0]}"; url="${release_info[1]}"; asset="${release_info[2]}"
   expected="${release_info[3]}"; manifest="${release_info[4]}"
   target="$VERSIONS/$tag/realm"
+  if [[ "$asset" == realm-slim-* ]]; then executable=realm-slim; target="$VERSIONS/slim-$tag/realm"; fi
   if [[ ! -x "$target" ]]; then
     info "正在下载 Realm $tag：$asset"
     fetch "$url" "$temporary/realm.tar.gz" || { fail '内核下载失败，请稍后重试。'; exit 1; }
@@ -815,14 +936,14 @@ install_core() (
       warn '该官方版本没有提供 SHA256；本次只能确认通过 HTTPS 下载，无法进行官方哈希校验。'
     fi
     tar -tzf "$temporary/realm.tar.gz" > "$temporary/members" || exit 1
-    member=$(data archive-member "$temporary/members") || exit 1
+    member=$(data archive-member "$temporary/members" "$executable") || exit 1
     tar -xOzf "$temporary/realm.tar.gz" -- "$member" > "$temporary/realm" || exit 1
     [[ -s "$temporary/realm" ]] || { fail '安装包中的 realm 文件为空。'; exit 1; }
     chmod 755 "$temporary/realm" || exit 1
     detected=$("$temporary/realm" --version 9>&-) || { fail '内核无法执行，可能是 CPU / 系统库不兼容。'; exit 1; }
     [[ "$detected" =~ ^[Rr]ealm[[:space:]]+[0-9]+\. ]] || { fail '内核没有返回有效的 Realm 版本信息。'; exit 1; }
     info "内核可执行：$detected"
-    mkdir -p "$VERSIONS/$tag" || exit 1
+    mkdir -p "$(dirname "$target")" || exit 1
     mv -f "$temporary/realm" "$target" || exit 1
   else
     "$target" --version >/dev/null 9>&- || { fail '已缓存的内核无法执行。'; exit 1; }
@@ -839,6 +960,7 @@ install_core() (
     if ! { service_restart && wait_service; }; then show_logs >&2 || true; exit 1; fi
   fi
   done=1
+  prune_core_versions "$old" || warn '旧内核清理未完成，可在下次打开 rnode 时重试。'
   info "Realm $tag 已安装。已有规则保持不变。"
 )
 
@@ -892,7 +1014,8 @@ apply_state() (
   else : > "$temporary/old-config"
   fi
   cp "$candidate" "$temporary/new-state" && data render "$candidate" "$temporary/new-config" || exit 1
-  backup_state >/dev/null || { fail '无法保存备份，没有修改现有规则。'; exit 1; }
+  backup_state "$BACKUPS" "auto-$(date +%Y%m%d-%H%M%S)" >/dev/null || { fail '无法保存备份，没有修改现有规则。'; exit 1; }
+  prune_auto_backups || exit 1
   if service_active; then active=1; fi
   if service_enabled; then enabled=1; fi
   count=$(data count "$candidate" enabled) || exit 1
@@ -1069,6 +1192,7 @@ status() {
   if [[ -x "$CORE_LINK" ]]; then "$CORE_LINK" --version 9>&- || true; else say 'Realm 内核：尚未安装（创建规则时自动安装）。'; fi
   if service_active; then say '运行状态：运行中'; else say '运行状态：已停止 / 尚未创建服务'; fi
   if service_enabled; then say '开机自启：开启'; else say '开机自启：关闭'; fi
+  if logging_enabled; then say 'Realm 日志：开启（warn）'; else say 'Realm 日志：关闭'; fi
   say "规则数量：$(data count "$STATE")；启用数量：$(data count "$STATE" enabled)"
   data list "$STATE"
 }
@@ -1100,16 +1224,20 @@ service_menu() {
     item 3 '停止全部转发，并关闭开机自启（保留规则）'
     item 4 '查看最近 60 条日志'
     item 5 '诊断连接问题'
+    if logging_enabled; then item 6 '关闭日志，并清空旧的独立日志文件'
+    else item 6 '开启日志（排障时使用）'
+    fi
     item 0 '返回主菜单'
-    IFS= read -r -p '请选择 [0-5]：' choice || return 0
+    IFS= read -r -p '请选择 [0-6]：' choice || return 0
     case "$choice" in
       1) status || true ;;
       2) start_service || true ;;
       3) if confirm '确认停止全部转发'; then stop_service || true; fi ;;
       4) show_logs || true ;;
       5) diagnose || true ;;
+      6) if logging_enabled; then set_logging off || true; else set_logging on || true; fi ;;
       0) return 0 ;;
-      *) warn '请输入 0～5。' ;;
+      *) warn '请输入 0～6。' ;;
     esac
   done
 }
@@ -1142,6 +1270,7 @@ backup_menu() {
       files=("$BACKUPS/"*.json)
       shopt -u nullglob
       ((${#files[@]})) || { say '还没有备份。'; return 0; }
+      mapfile -t files < <(LC_ALL=C ls -1tr -- "${files[@]}")
       for ((index=${#files[@]}-1; index>=0; index--)); do
         printf '  %s）%s\n' "$((${#files[@]}-index))" "${files[index]##*/}"
       done
@@ -1259,6 +1388,8 @@ Realm 中文转发管理（TCP + UDP）
       sudo rnode start               启动 / 重启并开启开机自启
       sudo rnode stop                停止并关闭开机自启，保留规则
       sudo rnode logs                查看最近日志
+      sudo rnode logs on             开启日志（服务运行中会重启）
+      sudo rnode logs off            关闭日志，清空旧的独立日志文件
       sudo rnode diagnose            检查本机入口和目标 TCP 连接
       sudo rnode backup              备份规则，输出备份路径
       sudo rnode restore /路径.json  确认后恢复备份
@@ -1279,6 +1410,9 @@ main() {
     *) usage; return 1 ;;
   esac
   [[ "$command_name" != restore || $# -eq 2 ]] || { fail '用法：sudo rnode restore /完整路径/备份.json'; return 1; }
+  if [[ "$command_name" == logs ]]; then
+    [[ $# -le 2 && ( $# -eq 1 || ${2:-} == on || ${2:-} == off ) ]] || { fail '用法：sudo rnode logs [on|off]'; return 1; }
+  fi
   require_root && detect_system && need_service_manager && ensure_dependencies || return 1
   if [[ "$command_name" == restore ]]; then init_data 1 || return 1; else init_data || return 1; fi
   case "$command_name" in
@@ -1292,7 +1426,7 @@ main() {
     status) status ;;
     start) start_service ;;
     stop) stop_service ;;
-    logs) show_logs ;;
+    logs) if [[ $# -eq 2 ]]; then set_logging "$2"; else show_logs; fi ;;
     diagnose) diagnose ;;
     backup) backup_state ;;
     restore) restore_state "$2" ;;
